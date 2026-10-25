@@ -1,8 +1,7 @@
-name: Sync Fork
+name: Sync Cloud Mail Fork
 
 on:
   schedule:
-    # 每 6 小时运行一次
     - cron: "0 */6 * * *"
   workflow_dispatch:
 
@@ -10,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-cloud-mail-${{ github.workflow }}
+  group: sync-cloud-mail
   cancel-in-progress: false
 
 jobs:
@@ -26,12 +25,11 @@ jobs:
           - dev
 
     steps:
-      - name: Checkout fork branch
+      - name: Checkout fork
         uses: actions/checkout@v4
         with:
           ref: ${{ matrix.branch }}
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Configure Git
         run: |
@@ -43,38 +41,286 @@ jobs:
         env:
           BRANCH: ${{ matrix.branch }}
         run: |
+          set -e
+
           git remote add upstream \
             https://github.com/maillab/cloud-mail.git
-
-          if ! git ls-remote --exit-code --heads \
-            upstream "$BRANCH" >/dev/null; then
-            echo "::error::Upstream branch '$BRANCH' does not exist"
-            exit 1
-          fi
 
           git fetch upstream \
             "refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH"
 
-      - name: Preserve dev wrangler configuration
+      # Only run the special checks on dev.
+      - name: Check upstream D1 KV R2 changes
+        id: bindings
         if: matrix.branch == 'dev'
+        env:
+          FILE: mail-worker/wrangler.toml
         run: |
-          # 仅对 dev 分支的指定文件启用自定义合并规则
-          # 冲突部分保留 fork 版本，非冲突部分正常合并上游更新
-          git config merge.wrangler-ours.name \
-            "Preserve fork wrangler configuration"
+          set -e
 
-          git config merge.wrangler-ours.driver \
-            'git merge-file --ours -p "%A" "%O" "%B" > "%A.tmp" && mv "%A.tmp" "%A"'
+          BASE=$(git merge-base HEAD upstream/dev)
 
-          printf '%s\n' \
-            'mail-worker/wrangler.toml merge=wrangler-ours' \
-            >> .git/info/attributes
+          if [ -z "$BASE" ]; then
+            echo "::error::Cannot find upstream merge base"
+            exit 1
+          fi
 
-      - name: Merge upstream updates
+          git show "$BASE:$FILE" > /tmp/upstream-old.toml
+          git show "upstream/dev:$FILE" > /tmp/upstream-new.toml
+
+          cp "$FILE" /tmp/fork-wrangler.toml
+
+          python3 <<'PY'
+          import os
+          import re
+          import json
+          import difflib
+
+          TARGETS = {
+              "d1_databases",
+              "kv_namespaces",
+              "r2_buckets",
+          }
+
+          HEADER = re.compile(
+              r'^\s*(#\s*)?(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$'
+          )
+
+          def get_header(line):
+              match = HEADER.match(line)
+              if not match:
+                  return None
+
+              if len(match.group(2)) != len(match.group(4)):
+                  return None
+
+              return match.group(3), bool(match.group(1))
+
+          def get_blocks(path, active_only=False):
+              with open(path, encoding="utf-8") as f:
+                  lines = f.read().splitlines()
+
+              blocks = []
+              i = 0
+
+              while i < len(lines):
+                  header = get_header(lines[i])
+
+                  if header and header[0] in TARGETS:
+                      name, commented = header
+                      start = i
+                      i += 1
+
+                      while i < len(lines):
+                          if get_header(lines[i]):
+                              break
+                          i += 1
+
+                      if not (active_only and commented):
+                          block = lines[start:i]
+
+                          while block and not block[-1].strip():
+                              block.pop()
+
+                          blocks.append((name, block))
+                  else:
+                      i += 1
+
+              return blocks
+
+          # Preserve only active custom bindings from the fork.
+          fork_blocks = get_blocks(
+              "/tmp/fork-wrangler.toml",
+              active_only=True,
+          )
+
+          present = {name for name, _ in fork_blocks}
+
+          if present != TARGETS:
+              missing = sorted(TARGETS - present)
+              raise SystemExit(
+                  "Required custom D1/KV/R2 bindings missing: "
+                  + ", ".join(missing)
+              )
+
+          with open("/tmp/fork-bindings.json", "w") as f:
+              json.dump(fork_blocks, f, ensure_ascii=False)
+
+          # Compare the relevant upstream sections at the common
+          # ancestor against the latest upstream version.
+          old_blocks = get_blocks("/tmp/upstream-old.toml")
+          new_blocks = get_blocks("/tmp/upstream-new.toml")
+
+          def render(blocks):
+              return "\n\n".join(
+                  "\n".join(lines) for _, lines in blocks
+              ) + "\n"
+
+          old_text = render(old_blocks)
+          new_text = render(new_blocks)
+
+          changed = old_text != new_text
+
+          with open("/tmp/binding-diff.txt", "w") as f:
+              f.writelines(difflib.unified_diff(
+                  old_text.splitlines(True),
+                  new_text.splitlines(True),
+                  fromfile="previous upstream D1/KV/R2",
+                  tofile="latest upstream D1/KV/R2",
+              ))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(
+                  "changed="
+                  + str(changed).lower()
+                  + "\n"
+              )
+
+          print("Upstream D1/KV/R2 changed:", changed)
+
+          if changed:
+              print("Upstream binding changes:")
+              print(new_text)
+          PY
+
+      # Fail before merging or pushing dev if bindings changed.
+      - name: Stop sync if upstream bindings changed
+        if: >-
+          matrix.branch == 'dev' &&
+          steps.bindings.outputs.changed == 'true'
+        run: |
+          echo "::error::Upstream D1/KV/R2 configuration changed."
+          echo "::error::Review upstream changes before syncing dev."
+          exit 1
+
+      - name: Merge upstream
         env:
           BRANCH: ${{ matrix.branch }}
+          FILE: mail-worker/wrangler.toml
         run: |
-          git merge --no-edit "upstream/$BRANCH"
+          set -e
+
+          if git merge --no-edit "upstream/$BRANCH"; then
+            echo "Upstream merge successful"
+          else
+            mapfile -t CONFLICTS < <(
+              git diff --name-only --diff-filter=U
+            )
+
+            if [ "$BRANCH" = "dev" ] &&
+               [ "${#CONFLICTS[@]}" -eq 1 ] &&
+               [ "${CONFLICTS[0]}" = "$FILE" ]; then
+
+              # Other parts of wrangler.toml will be replaced
+              # with upstream's latest version below.
+              git checkout --theirs -- "$FILE"
+              git add "$FILE"
+              git commit --no-edit
+            else
+              git merge --abort || true
+              echo "::error::Unexpected merge conflict"
+              exit 1
+            fi
+          fi
+
+      # Rebuild wrangler.toml from upstream's latest file,
+      # restoring only the fork's active D1/KV/R2 blocks.
+      - name: Restore custom bindings on dev
+        if: matrix.branch == 'dev'
+        run: |
+          set -e
+
+          cp /tmp/upstream-new.toml \
+            mail-worker/wrangler.toml
+
+          python3 <<'PY'
+          import json
+          import re
+
+          TARGETS = {
+              "d1_databases",
+              "kv_namespaces",
+              "r2_buckets",
+          }
+
+          HEADER = re.compile(
+              r'^\s*(#\s*)?(\[\[?)([\w.-]+)(\]\]?)\s*(?:#.*)?$'
+          )
+
+          def get_header(line):
+              match = HEADER.match(line)
+              if not match:
+                  return None
+
+              if len(match.group(2)) != len(match.group(4)):
+                  return None
+
+              return match.group(3), bool(match.group(1))
+
+          with open("/tmp/fork-bindings.json", encoding="utf-8") as f:
+              bindings = json.load(f)
+
+          path = "mail-worker/wrangler.toml"
+
+          with open(path, encoding="utf-8") as f:
+              lines = f.read().splitlines()
+
+          output = []
+          inserted = False
+          i = 0
+
+          def insert_bindings():
+              for _, block in bindings:
+                  output.extend(block)
+                  output.append("")
+
+          while i < len(lines):
+              header = get_header(lines[i])
+
+              if header and header[0] in TARGETS:
+                  if not inserted:
+                      insert_bindings()
+                      inserted = True
+
+                  # Remove upstream's template section.
+                  i += 1
+
+                  while i < len(lines) and not get_header(lines[i]):
+                      i += 1
+
+                  continue
+
+              # If upstream removes the template sections,
+              # insert custom bindings before send_email.
+              if (
+                  not inserted
+                  and header
+                  and header[0] == "send_email"
+                  and not header[1]
+              ):
+                  insert_bindings()
+                  inserted = True
+
+              output.append(lines[i])
+              i += 1
+
+          if not inserted:
+              output.append("")
+              insert_bindings()
+
+          while output and not output[-1].strip():
+              output.pop()
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write("\n".join(output) + "\n")
+          PY
+
+          git add mail-worker/wrangler.toml
+
+          if ! git diff --cached --quiet; then
+            git commit -m \
+              "Preserve custom D1 KV R2 bindings"
+          fi
 
       - name: Push synchronized branch
         env:
