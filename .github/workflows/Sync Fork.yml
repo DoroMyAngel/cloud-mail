@@ -1,0 +1,83 @@
+name: Sync Cloud Mail Fork
+
+on:
+  schedule:
+    # 每 6 小时运行一次
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-cloud-mail-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - mail
+          - dev
+
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          git remote add upstream \
+            https://github.com/maillab/cloud-mail.git
+
+          if ! git ls-remote --exit-code --heads \
+            upstream "$BRANCH" >/dev/null; then
+            echo "::error::Upstream branch '$BRANCH' does not exist"
+            exit 1
+          fi
+
+          git fetch upstream \
+            "refs/heads/$BRANCH:refs/remotes/upstream/$BRANCH"
+
+      - name: Preserve dev wrangler configuration
+        if: matrix.branch == 'dev'
+        run: |
+          # 仅对 dev 分支的指定文件启用自定义合并规则
+          # 冲突部分保留 fork 版本，非冲突部分正常合并上游更新
+          git config merge.wrangler-ours.name \
+            "Preserve fork wrangler configuration"
+
+          git config merge.wrangler-ours.driver \
+            'git merge-file --ours -p "%A" "%O" "%B" > "%A.tmp" && mv "%A.tmp" "%A"'
+
+          printf '%s\n' \
+            'mail-worker/wrangler.toml merge=wrangler-ours' \
+            >> .git/info/attributes
+
+      - name: Merge upstream updates
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          git merge --no-edit "upstream/$BRANCH"
+
+      - name: Push synchronized branch
+        env:
+          BRANCH: ${{ matrix.branch }}
+        run: |
+          git push origin "HEAD:refs/heads/$BRANCH"
